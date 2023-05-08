@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand" // For retries
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -59,6 +60,20 @@ func (s *Session) RequestWithBucketID(method, urlStr string, data interface{}, b
 	return s.request(method, urlStr, "application/json", body, bucketID, 0)
 }
 
+var globalRatelimit = make(chan struct{}, 25)
+
+func init() {
+	const shardCount = 22
+	const maxRequestInterval = time.Second * shardCount / 50
+
+	go func(ch chan struct{}, d time.Duration) {
+		for {
+			ch <- struct{}{}
+			time.Sleep(d)
+		}
+	}(globalRatelimit, maxRequestInterval)
+}
+
 // request makes a (GET/POST/...) Requests to Discord REST API.
 // Sequence is the sequence number, if it fails with a 502 it will
 // retry with sequence+1 until it either succeeds or sequence >= session.MaxRestRetries
@@ -71,108 +86,144 @@ func (s *Session) request(method, urlStr, contentType string, b []byte, bucketID
 
 // RequestWithLockedBucket makes a request using a bucket that's already been locked
 func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b []byte, bucket *Bucket, sequence int) (response []byte, err error) {
+
 	if s.Debug {
 		log.Printf("API REQUEST %8s :: %s\n", method, urlStr)
 		log.Printf("API REQUEST  PAYLOAD :: [%s]\n", string(b))
 	}
 
-	req, err := http.NewRequest(method, urlStr, bytes.NewBuffer(b))
-	if err != nil {
-		bucket.Release(nil)
-		return
-	}
+	var instructedRetryDelay, minRetryDelay time.Duration = 0, 0
+retry:
+	for {
+		// Exponential backoff without blowing the stack
+		if minRetryDelay > time.Duration(0) {
+			thisRetry := minRetryDelay + instructedRetryDelay + time.Duration(rand.Int63n(int64(minRetryDelay)))
+			fmt.Printf("Rate Limiting %s, retry in %v\n", urlStr, thisRetry)
+			time.Sleep(thisRetry)
 
-	// Not used on initial login..
-	// TODO: Verify if a login, otherwise complain about no-token
-	if s.Token != "" {
-		req.Header.Set("authorization", s.Token)
-	}
-
-	// Discord's API returns a 400 Bad Request is Content-Type is set, but the
-	// request body is empty.
-	if b != nil {
-		req.Header.Set("Content-Type", contentType)
-	}
-
-	// TODO: Make a configurable static variable.
-	req.Header.Set("User-Agent", s.UserAgent)
-
-	if s.Debug {
-		for k, v := range req.Header {
-			log.Printf("API REQUEST   HEADER :: [%s] = %+v\n", k, v)
+			instructedRetryDelay = 0
+			minRetryDelay *= 2
+			if minRetryDelay > 1*time.Hour {
+				minRetryDelay = 1 * time.Hour
+				log.Printf("API Request retry reached 1 hour: %s %s\n", method, urlStr)
+			}
+		} else {
+			minRetryDelay = 250 * time.Millisecond
 		}
-	}
+		<-globalRatelimit
+		// END exponential backoff code
 
-	resp, err := s.Client.Do(req)
-	if err != nil {
-		bucket.Release(nil)
-		return
-	}
-	defer func() {
+		req, err := http.NewRequest(method, urlStr, bytes.NewBuffer(b))
+		if err != nil {
+			bucket.Release(nil)
+			return nil, err
+		}
+
+		// Not used on initial login..
+		// TODO: Verify if a login, otherwise complain about no-token
+		if s.Token != "" {
+			req.Header.Set("authorization", s.Token)
+		}
+
+		// Discord's API returns a 400 Bad Request is Content-Type is set, but the
+		// request body is empty.
+		if b != nil {
+			req.Header.Set("Content-Type", contentType)
+		}
+
+		// TODO: Make a configurable static variable.
+		req.Header.Set("User-Agent", s.UserAgent)
+
+		if s.Debug {
+			for k, v := range req.Header {
+				log.Printf("API REQUEST   HEADER :: [%s] = %+v\n", k, v)
+			}
+		}
+
+		resp, err := s.Client.Do(req)
+		if err != nil {
+			bucket.Release(nil)
+			return nil, err
+		}
+		/* defer func() {
+			err2 := resp.Body.Close()
+			if err2 != nil {
+				log.Println("error closing resp body:", err2)
+			}
+		}() */
+
+		err = bucket.Release(resp.Header)
+		if err != nil {
+			err2 := resp.Body.Close()
+			if err2 != nil {
+				log.Println("error closing resp body:", err2)
+			}
+			return nil, err
+		}
+
+		response, err = ioutil.ReadAll(resp.Body)
 		err2 := resp.Body.Close()
 		if err2 != nil {
-			log.Println("error closing resp body")
+			log.Println("error closing resp body:", err2)
 		}
-	}()
-
-	err = bucket.Release(resp.Header)
-	if err != nil {
-		return
-	}
-
-	response, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	if s.Debug {
-
-		log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
-		for k, v := range resp.Header {
-			log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
-		}
-		log.Printf("API RESPONSE    BODY :: [%s]\n\n\n", response)
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusCreated:
-	case http.StatusNoContent:
-	case http.StatusBadGateway:
-		// Retry sending request if possible
-		if sequence < s.MaxRestRetries {
-
-			s.log(LogInformational, "%s Failed (%s), Retrying...", urlStr, resp.Status)
-			response, err = s.RequestWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence+1)
-		} else {
-			err = fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
-		}
-	case 429: // TOO MANY REQUESTS - Rate limiting
-		rl := TooManyRequests{}
-		err = json.Unmarshal(response, &rl)
 		if err != nil {
-			s.log(LogError, "rate limit unmarshal error, %s", err)
-			return
+			return response, err
 		}
-		s.log(LogInformational, "Rate Limiting %s, retry in %d", urlStr, rl.RetryAfter)
-		s.handleEvent(rateLimitEventType, &RateLimit{TooManyRequests: &rl, URL: urlStr})
 
-		time.Sleep(rl.RetryAfter * time.Millisecond)
-		// we can make the above smarter
-		// this method can cause longer delays than required
+		if s.Debug {
 
-		response, err = s.RequestWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence)
-	case http.StatusUnauthorized:
-		if strings.Index(s.Token, "Bot ") != 0 {
-			s.log(LogInformational, ErrUnauthorized.Error())
-			err = ErrUnauthorized
+			log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
+			for k, v := range resp.Header {
+				log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
+			}
+			log.Printf("API RESPONSE    BODY :: [%s]\n\n\n", response)
 		}
-		fallthrough
-	default: // Error condition
-		err = newRestError(req, resp, response)
+
+		switch resp.StatusCode {
+		case http.StatusOK:
+		case http.StatusCreated:
+		case http.StatusNoContent:
+		case http.StatusBadGateway:
+			// Retry sending request if possible
+			if sequence < s.MaxRestRetries {
+
+				s.log(LogInformational, "%s Failed (%s), Retrying...", urlStr, resp.Status)
+				sequence += 1
+				s.Ratelimiter.LockBucketObject(bucket)
+				continue retry
+			} else {
+				err = fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
+			}
+		case 429: // TOO MANY REQUESTS - Rate limiting
+			rl := TooManyRequests{}
+			err = json.Unmarshal(response, &rl)
+			if err != nil {
+				s.log(LogError, "rate limit unmarshal error, %s", err)
+				// return
+			}
+
+			if rl.RetryAfter == 0 {
+				rl.RetryAfter = 1 * time.Second
+			}
+
+			//s.log(LogInformational, "Rate Limiting %s, retry in %v", urlStr, rl.RetryAfter)
+			s.handleEvent(rateLimitEventType, &RateLimit{TooManyRequests: &rl, URL: urlStr})
+
+			instructedRetryDelay = rl.RetryAfter
+			s.Ratelimiter.LockBucketObject(bucket)
+			continue retry
+		case http.StatusUnauthorized:
+			if strings.Index(s.Token, "Bot ") != 0 {
+				s.log(LogInformational, ErrUnauthorized.Error())
+				err = ErrUnauthorized
+			}
+			fallthrough
+		default: // Error condition
+			err = newRestError(req, resp, response)
+		}
+
+		return response, err
 	}
-
-	return
 }
 
 func unmarshal(data []byte, v interface{}) error {
@@ -1048,7 +1099,7 @@ func (s *Session) GuildRoleCreate(guildID string) (st *Role, err error) {
 // hoist     : Whether to display the role's users separately.
 // perm      : The permissions for the role.
 // mention   : Whether this role is mentionable
-func (s *Session) GuildRoleEdit(guildID, roleID, name string, color int, hoist bool, perm int, mention bool) (st *Role, err error) {
+func (s *Session) GuildRoleEdit(guildID, roleID, name string, color int, hoist bool, perm int64, mention bool) (st *Role, err error) {
 
 	// Prevent sending a color int that is too big.
 	if color > 0xFFFFFF {
@@ -1057,11 +1108,11 @@ func (s *Session) GuildRoleEdit(guildID, roleID, name string, color int, hoist b
 	}
 
 	data := struct {
-		Name        string `json:"name"`        // The role's name (overwrites existing)
-		Color       int    `json:"color"`       // The color the role should have (as a decimal, not hex)
-		Hoist       bool   `json:"hoist"`       // Whether to display the role's users separately
-		Permissions int    `json:"permissions"` // The overall permissions number of the role (overwrites existing)
-		Mentionable bool   `json:"mentionable"` // Whether this role is mentionable
+		Name        string `json:"name"`               // The role's name (overwrites existing)
+		Color       int    `json:"color"`              // The color the role should have (as a decimal, not hex)
+		Hoist       bool   `json:"hoist"`              // Whether to display the role's users separately
+		Permissions int64  `json:"permissions,string"` // The overall permissions number of the role (overwrites existing)
+		Mentionable bool   `json:"mentionable"`        // Whether this role is mentionable
 	}{name, color, hoist, perm, mention}
 
 	body, err := s.RequestWithBucketID("PATCH", EndpointGuildRole(guildID, roleID), data, EndpointGuildRole(guildID, ""))
@@ -1807,13 +1858,13 @@ func (s *Session) ChannelInviteCreate(channelID string, i Invite) (st *Invite, e
 // ChannelPermissionSet creates a Permission Override for the given channel.
 // NOTE: This func name may changed.  Using Set instead of Create because
 // you can both create a new override or update an override with this function.
-func (s *Session) ChannelPermissionSet(channelID, targetID string, targetType PermissionOverwriteType, allow, deny int) (err error) {
+func (s *Session) ChannelPermissionSet(channelID, targetID string, targetType PermissionOverwriteType, allow, deny int64) (err error) {
 
 	data := struct {
 		ID    string                  `json:"id"`
 		Type  PermissionOverwriteType `json:"type"`
-		Allow int                     `json:"allow"`
-		Deny  int                     `json:"deny"`
+		Allow int64                   `json:"allow,string"`
+		Deny  int64                   `json:"deny,string"`
 	}{targetID, targetType, allow, deny}
 
 	_, err = s.RequestWithBucketID("PUT", EndpointChannelPermission(channelID, targetID), data, EndpointChannelPermission(channelID, ""))
@@ -2205,6 +2256,19 @@ func (s *Session) MessageReactionRemove(channelID, messageID, emojiID, userID st
 func (s *Session) MessageReactionsRemoveAll(channelID, messageID string) error {
 
 	_, err := s.RequestWithBucketID("DELETE", EndpointMessageReactionsAll(channelID, messageID), nil, EndpointMessageReactionsAll(channelID, messageID))
+
+	return err
+}
+
+// MessageReactionsRemoveEmoji deletes all reactions of a certain emoji from a message
+// channelID : The channel ID
+// messageID : The message ID
+// emojiID   : The emoji ID
+func (s *Session) MessageReactionsRemoveEmoji(channelID, messageID, emojiID string) error {
+
+	// emoji such as  #⃣ need to have # escaped
+	emojiID = strings.Replace(emojiID, "#", "%23", -1)
+	_, err := s.RequestWithBucketID("DELETE", EndpointMessageReactions(channelID, messageID, emojiID), nil, EndpointMessageReactions(channelID, messageID, emojiID))
 
 	return err
 }
